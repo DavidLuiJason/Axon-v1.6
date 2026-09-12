@@ -1,9 +1,10 @@
-import React, { createContext, useContext, useState, useEffect, useMemo, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   ScreenId,
   PaneViewState,
   NavHistoryEntry,
   ChatMessage,
+  ChatAttachment,
   NoteItem,
   NoteCategory,
   ProjectItem,
@@ -30,6 +31,8 @@ import {
   FunctionColors,
   ProjectActivityEvent,
   ProjectTimelineQuery,
+  WorkspaceCodeLoadMode,
+  WorkspaceSnippetHistoryItem,
 } from '../types';
 import {
   captureScreenScroll,
@@ -141,8 +144,8 @@ interface AppContextType {
   messages: ChatMessage[];
   activeProjectMessages: ChatMessage[];
   addMessage: (
-    textOrOptions: string | { text: string; sender?: 'user' | 'axon'; attachment?: { name: string; type: string; size?: string; dataUrl?: string } },
-    attachment?: { name: string; type: string; size?: string; dataUrl?: string }
+    textOrOptions: string | { text: string; sender?: 'user' | 'axon'; attachment?: ChatAttachment; attachments?: ChatAttachment[] },
+    attachment?: ChatAttachment | ChatAttachment[]
   ) => void;
   deleteMessage: (messageId: string) => void;
   clearMessages: () => void;
@@ -202,6 +205,14 @@ interface AppContextType {
   savedScripts: SavedScript[];
   saveScript: (script: Omit<SavedScript, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }) => SavedScript;
   deleteScript: (id: string) => void;
+
+  // Workspace Code Loading & Snippet History
+  workspaceCodeLoadMode: WorkspaceCodeLoadMode;
+  setWorkspaceCodeLoadMode: (mode: WorkspaceCodeLoadMode) => void;
+  workspaceSnippetHistory: WorkspaceSnippetHistoryItem[];
+  addWorkspaceSnippetHistory: (entry: Omit<WorkspaceSnippetHistoryItem, 'id' | 'timestamp'>) => void;
+  deleteWorkspaceSnippetHistoryItem: (id: string) => void;
+  clearWorkspaceSnippetHistory: () => void;
 
   // Automation Rules Engine (Part 5)
   automationRules: AutomationRule[];
@@ -837,6 +848,73 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSavedScripts((prev) => prev.filter((s) => s.id !== id));
     showToast('Script deleted');
   };
+
+  // Workspace Code Loading Mode & Snippet History
+  const [workspaceCodeLoadMode, setWorkspaceCodeLoadModeState] = useState<WorkspaceCodeLoadMode>(() => {
+    try {
+      const saved = localStorage.getItem('axon_workspace_code_load_mode_v1');
+      if (saved === 'auto' || saved === 'manual') return saved;
+    } catch {}
+    return 'manual';
+  });
+
+  const setWorkspaceCodeLoadMode = useCallback((mode: WorkspaceCodeLoadMode) => {
+    setWorkspaceCodeLoadModeState(mode);
+    try {
+      localStorage.setItem('axon_workspace_code_load_mode_v1', mode);
+    } catch {}
+    showToast(`Workspace code loading set to ${mode === 'auto' ? 'Auto-load' : 'Manual'}`);
+  }, []);
+
+  const [workspaceSnippetHistory, setWorkspaceSnippetHistory] = useState<WorkspaceSnippetHistoryItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('axon_workspace_history_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {}
+    return [];
+  });
+
+  const addWorkspaceSnippetHistory = useCallback((entry: Omit<WorkspaceSnippetHistoryItem, 'id' | 'timestamp'>) => {
+    setWorkspaceSnippetHistory((prev) => {
+      // Avoid duplicate consecutive entries with identical code
+      if (prev.length > 0 && prev[0].code.trim() === entry.code.trim()) {
+        return prev;
+      }
+      const newItem: WorkspaceSnippetHistoryItem = {
+        ...entry,
+        id: `snip-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' }),
+        lineCount: entry.code.split('\n').length,
+        byteSize: new Blob([entry.code]).size,
+      };
+      const updated = [newItem, ...prev].slice(0, 100);
+      try {
+        localStorage.setItem('axon_workspace_history_v1', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+  }, []);
+
+  const deleteWorkspaceSnippetHistoryItem = useCallback((id: string) => {
+    setWorkspaceSnippetHistory((prev) => {
+      const updated = prev.filter((item) => item.id !== id);
+      try {
+        localStorage.setItem('axon_workspace_history_v1', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+  }, []);
+
+  const clearWorkspaceSnippetHistory = useCallback(() => {
+    setWorkspaceSnippetHistory([]);
+    try {
+      localStorage.removeItem('axon_workspace_history_v1');
+    } catch {}
+    showToast('Workspace snippet history cleared');
+  }, []);
 
   // Part 5: Automation Rules Engine State
   const [automationRules, setAutomationRules] = useState<AutomationRule[]>(() => {
@@ -1763,7 +1841,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const sumRes = await fetch('/api/ai/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: projMessages.slice(-30) }),
+        body: JSON.stringify({
+          messages: projMessages.slice(-30).map((m) => ({ sender: m.sender, text: m.text })),
+        }),
       });
       if (sumRes.ok) {
         const sumData = await sumRes.json();
@@ -1813,24 +1893,39 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Messages / AI Dispatch
   const addMessage = async (
-    textOrOptions: string | { text: string; sender?: 'user' | 'axon'; attachment?: { name: string; type: string; size?: string; dataUrl?: string } },
-    attachmentParam?: { name: string; type: string; size?: string; dataUrl?: string }
+    textOrOptions: string | { text: string; sender?: 'user' | 'axon'; attachment?: ChatAttachment; attachments?: ChatAttachment[] },
+    attachmentParam?: ChatAttachment | ChatAttachment[]
   ) => {
     let rawText = '';
-    let attachment = attachmentParam;
+    let attachmentsList: ChatAttachment[] = [];
 
     if (typeof textOrOptions === 'string') {
       rawText = textOrOptions;
+      if (Array.isArray(attachmentParam)) {
+        attachmentsList = attachmentParam;
+      } else if (attachmentParam) {
+        attachmentsList = [attachmentParam];
+      }
     } else if (textOrOptions && typeof textOrOptions === 'object') {
       rawText = typeof textOrOptions.text === 'string' ? textOrOptions.text : String(textOrOptions.text || '');
-      if (!attachment && textOrOptions.attachment) {
-        attachment = textOrOptions.attachment;
+      if (Array.isArray(textOrOptions.attachments) && textOrOptions.attachments.length > 0) {
+        attachmentsList = textOrOptions.attachments;
+      } else if (textOrOptions.attachment) {
+        attachmentsList = [textOrOptions.attachment];
+      }
+      if (attachmentsList.length === 0 && attachmentParam) {
+        if (Array.isArray(attachmentParam)) {
+          attachmentsList = attachmentParam;
+        } else {
+          attachmentsList = [attachmentParam];
+        }
       }
     } else if (textOrOptions != null) {
       rawText = String(textOrOptions);
     }
 
     const text = rawText;
+    const primaryAttachment = attachmentsList[0] || undefined;
 
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -1838,7 +1933,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       text,
       projectId: activeProjectId,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      attachment,
+      attachment: primaryAttachment,
+      attachments: attachmentsList.length > 0 ? attachmentsList : undefined,
     };
 
     const nextMessages = [...messages, userMsg];
@@ -1856,7 +1952,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         id: userMsg.id,
         text,
         projectId: activeProjectId,
-        attachment,
+        attachment: primaryAttachment,
+        attachments: attachmentsList,
         context: {
           conversationHistory: activeProjectHistory,
           projectNotes: activeProjectNotes,
@@ -2074,13 +2171,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     // 5. AXON Local Core offline execution (no external network request required)
+    const hasVisualAttachment = attachmentsList.some(
+      (a) => a?.type?.startsWith('image/') || (typeof a?.dataUrl === 'string' && a.dataUrl.startsWith('data:image/'))
+    );
+
     const isAxonModel =
       activeModel.provider === 'axon' ||
       activeModel.id === 'axon-offline-core' ||
       activeModel.id?.includes('axon') ||
       activeModel.name?.toLowerCase().includes('axon');
 
-    if (isAxonModel) {
+    // If it's the default AXON model and there are NO images, run on-device local core
+    // If there ARE image attachments, AXON delegates vision analysis to Gemini vision unless offline
+    if (isAxonModel && !hasVisualAttachment) {
       setIsGeneratingResponse(true);
       setLiveThinkingStatus('Processing on-device...');
       try {
@@ -2089,7 +2192,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             id: userMsg.id,
             text,
             projectId: activeProjectId,
-            attachment,
+            attachment: primaryAttachment,
+            attachments: attachmentsList,
             context: {
               conversationHistory: activeProjectHistory,
               projectNotes: activeProjectNotes,
@@ -2100,6 +2204,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           },
           brainResult
         );
+
+        // Auto-load code to workspace snippet history if auto mode is enabled
+        if (workspaceCodeLoadMode === 'auto') {
+          const codeMatch = localReply.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
+          if (codeMatch && codeMatch[2].trim()) {
+            const detectedCode = codeMatch[2].trim();
+            const rawLang = (codeMatch[1] || 'javascript').toLowerCase();
+            let lang = 'javascript';
+            if (rawLang.includes('html') || detectedCode.includes('<html') || detectedCode.includes('<!DOCTYPE')) {
+              lang = 'html';
+            } else if (rawLang.includes('json')) {
+              lang = 'json';
+            }
+            const firstLine = detectedCode.split('\n')[0].replace(/^\/\/\s*|^<!--\s*|^#\s*/, '').trim();
+            const snippetTitle = firstLine && firstLine.length < 50 ? firstLine : `Generated ${lang.toUpperCase()}`;
+            addWorkspaceSnippetHistory({
+              title: snippetTitle,
+              code: detectedCode,
+              language: lang,
+              source: 'chat_auto',
+            });
+          }
+        }
 
         setMessages((prev) => [
           ...prev,
@@ -2118,7 +2245,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           id: userMsg.id,
           text,
           projectId: activeProjectId,
-          attachment,
+          attachment: primaryAttachment,
+          attachments: attachmentsList,
         });
         setMessages((prev) => [
           ...prev,
@@ -2142,12 +2270,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // Compute concise activity status label
     let currentStatusLabel = 'Thinking...';
-    if (attachment?.type?.startsWith('application/pdf') || text.toLowerCase().includes('.pdf')) {
+    if (attachmentsList.some((a) => a?.type?.startsWith('application/pdf')) || text.toLowerCase().includes('.pdf')) {
       currentStatusLabel = 'Analyzing PDF';
-    } else if (attachment?.type?.startsWith('image/') || text.toLowerCase().includes('image')) {
-      currentStatusLabel = 'Referencing image';
-    } else if (attachment) {
-      currentStatusLabel = 'Inspecting document';
+    } else if (hasVisualAttachment || text.toLowerCase().includes('image')) {
+      currentStatusLabel = 'Analyzing image...';
+    } else if (attachmentsList.length > 0) {
+      currentStatusLabel = 'Inspecting files...';
     } else if (activeProjectNotes.length > 0 || activeProject.systemContext) {
       currentStatusLabel = 'Recalling project context';
     } else if (/(?:code|function|script|component|build|implement)/i.test(text)) {
@@ -2170,6 +2298,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       let response: Response | null = null;
       let data: any = null;
 
+      // When AXON model has images, route delegation to Gemini Vision
+      const effectiveProvider = (isAxonModel && hasVisualAttachment) ? 'gemini' : activeModel.provider;
+      const effectiveModelId = (isAxonModel && hasVisualAttachment) ? 'gemini-2.5-flash' : activeModel.id;
+
       while (attempt < maxRetries) {
         attempt++;
         try {
@@ -2177,8 +2309,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              provider: activeModel.provider,
-              model: activeModel.id,
+              provider: effectiveProvider,
+              model: effectiveModelId,
               messages: activeProjectHistory
                 .filter((m) => {
                   if (m.isRateLimitedNotice) return false;
@@ -2188,9 +2320,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                   }
                   return true;
                 })
-                .map((m) =>
-                  m.id === userMsg.id ? { sender: m.sender, text: promptForDispatch } : { sender: m.sender, text: m.text }
-                ),
+                .map((m, idx, arr) => {
+                  const itemAttachments = m.attachments || (m.attachment ? [m.attachment] : undefined);
+                  const isCurrentTurn = m.id === userMsg.id || idx >= arr.length - 2;
+                  const sanitizedAttachments = itemAttachments?.map((att) => {
+                    if (isCurrentTurn) return att;
+                    // For older history turns, retain name and type info but strip heavy dataUrl to prevent payload overflow
+                    return {
+                      name: att.name,
+                      type: att.type,
+                      size: att.size,
+                    };
+                  });
+                  return {
+                    sender: m.sender,
+                    text: m.id === userMsg.id ? promptForDispatch : m.text,
+                    attachments: sanitizedAttachments,
+                    attachment: sanitizedAttachments && sanitizedAttachments[0],
+                  };
+                }),
               apiKey: currentAccount?.apiKey || '',
               accountLabel: currentAccount?.label || 'Primary',
               conversationSummary,
@@ -2369,6 +2517,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
 
+      // Auto-load code to workspace snippet history if auto mode is enabled
+      if (workspaceCodeLoadMode === 'auto') {
+        const codeMatch = finalResponseText.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
+        if (codeMatch && codeMatch[2].trim()) {
+          const detectedCode = codeMatch[2].trim();
+          const rawLang = (codeMatch[1] || 'javascript').toLowerCase();
+          let lang = 'javascript';
+          if (rawLang.includes('html') || detectedCode.includes('<html') || detectedCode.includes('<!DOCTYPE')) {
+            lang = 'html';
+          } else if (rawLang.includes('json')) {
+            lang = 'json';
+          }
+          const firstLine = detectedCode.split('\n')[0].replace(/^\/\/\s*|^<!--\s*|^#\s*/, '').trim();
+          const snippetTitle = firstLine && firstLine.length < 50 ? firstLine : `Generated ${lang.toUpperCase()}`;
+          addWorkspaceSnippetHistory({
+            title: snippetTitle,
+            code: detectedCode,
+            language: lang,
+            source: 'chat_auto',
+          });
+        }
+      }
+
       setMessages((prev) => [
         ...prev,
         {
@@ -2389,7 +2560,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             id: userMsg.id,
             text,
             projectId: activeProjectId,
-            attachment,
+            attachment: primaryAttachment,
+            attachments: attachmentsList,
             context: {
               conversationHistory: activeProjectHistory,
               projectNotes: activeProjectNotes,
@@ -2400,6 +2572,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           },
           brainResult
         );
+
+        // Auto-load code to workspace snippet history if auto mode is enabled
+        if (workspaceCodeLoadMode === 'auto') {
+          const codeMatch = offlineReply.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
+          if (codeMatch && codeMatch[2].trim()) {
+            const detectedCode = codeMatch[2].trim();
+            const rawLang = (codeMatch[1] || 'javascript').toLowerCase();
+            let lang = 'javascript';
+            if (rawLang.includes('html') || detectedCode.includes('<html') || detectedCode.includes('<!DOCTYPE')) {
+              lang = 'html';
+            } else if (rawLang.includes('json')) {
+              lang = 'json';
+            }
+            const firstLine = detectedCode.split('\n')[0].replace(/^\/\/\s*|^<!--\s*|^#\s*/, '').trim();
+            const snippetTitle = firstLine && firstLine.length < 50 ? firstLine : `Generated ${lang.toUpperCase()}`;
+            addWorkspaceSnippetHistory({
+              title: snippetTitle,
+              code: detectedCode,
+              language: lang,
+              source: 'chat_auto',
+            });
+          }
+        }
 
         setMessages((prev) => [
           ...prev,
@@ -2418,7 +2613,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           id: userMsg.id,
           text,
           projectId: activeProjectId,
-          attachment,
+          attachment: primaryAttachment,
+          attachments: attachmentsList,
         });
         setMessages((prev) => [
           ...prev,
@@ -2554,7 +2750,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: projectMsgs,
+          messages: projectMsgs.map((m) => ({ sender: m.sender, text: m.text })),
           projectName: targetProj.name,
           mode,
         }),
@@ -2952,6 +3148,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         savedScripts,
         saveScript,
         deleteScript,
+        workspaceCodeLoadMode,
+        setWorkspaceCodeLoadMode,
+        workspaceSnippetHistory,
+        addWorkspaceSnippetHistory,
+        deleteWorkspaceSnippetHistoryItem,
+        clearWorkspaceSnippetHistory,
         automationRules,
         saveRule,
         deleteRule,

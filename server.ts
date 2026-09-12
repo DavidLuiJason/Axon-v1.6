@@ -9,7 +9,20 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Error handling middleware for oversized payloads
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413 || err.name === 'PayloadTooLargeError')) {
+    console.warn('[Server] PayloadTooLargeError caught:', err.message);
+    return res.status(413).json({
+      success: false,
+      error: 'Request payload too large: The attached files or context exceed the server limit. Please use smaller files or reduce attachment sizes.',
+    });
+  }
+  next(err);
+});
 
 // Health Check
 app.get('/api/health', (req, res) => {
@@ -54,9 +67,12 @@ ${projectContext.relevantNotes ? `Project Notes & Knowledge Memory:\n${projectCo
 
 // Helpers to format conversation history robustly across AI providers
 
-function getCleanMessages(rawMessages: any[]): Array<{ sender: string; text: string; id?: string }> {
+function getCleanMessages(rawMessages: any[]): Array<{ sender: string; text: string; id?: string; attachments?: any[]; attachment?: any }> {
   return (rawMessages || []).filter((m: any) => {
-    if (!m || typeof m.text !== 'string' || !m.text.trim()) return false;
+    if (!m) return false;
+    const hasText = typeof m.text === 'string' && m.text.trim().length > 0;
+    const hasAttachments = (Array.isArray(m.attachments) && m.attachments.length > 0) || Boolean(m.attachment);
+    if (!hasText && !hasAttachments) return false;
     if (m.isRateLimitedNotice) return false;
     if (typeof m.id === 'string' && (m.id.includes('-limited') || m.id.includes('-cooldown') || m.id.includes('-nokey'))) return false;
     if (typeof m.id === 'string' && m.id.includes('-switch-') && m.sender === 'axon') return false;
@@ -64,81 +80,141 @@ function getCleanMessages(rawMessages: any[]): Array<{ sender: string; text: str
   });
 }
 
+function getMessageAttachments(m: any): any[] {
+  if (Array.isArray(m.attachments) && m.attachments.length > 0) {
+    return m.attachments;
+  }
+  if (m.attachment) {
+    return [m.attachment];
+  }
+  return [];
+}
+
 function formatGeminiContents(
   rawMessages: any[],
   formattedContext?: string
-): Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> {
+): Array<{ role: 'user' | 'model'; parts: any[] }> {
   const clean = getCleanMessages(rawMessages);
   if (clean.length === 0) {
     const defaultText = formattedContext ? `${formattedContext}Hello` : 'Hello';
     return [{ role: 'user', parts: [{ text: defaultText }] }];
   }
 
-  const mapped = clean.map((m) => ({
-    role: (m.sender === 'user' ? 'user' : 'model') as 'user' | 'model',
-    text: m.text.trim(),
-  }));
+  const mapped = clean.map((m) => {
+    const role = (m.sender === 'user' ? 'user' : 'model') as 'user' | 'model';
+    const text = typeof m.text === 'string' ? m.text.trim() : '';
+    const attachments = getMessageAttachments(m);
+    const parts: any[] = [];
 
-  // Coalesce consecutive messages from the same role
-  const coalesced: Array<{ role: 'user' | 'model'; text: string }> = [];
-  for (const item of mapped) {
-    if (coalesced.length > 0 && coalesced[coalesced.length - 1].role === item.role) {
-      coalesced[coalesced.length - 1].text += `\n\n${item.text}`;
-    } else {
-      coalesced.push({ role: item.role, text: item.text });
+    if (text) {
+      parts.push({ text });
     }
-  }
+
+    for (const att of attachments) {
+      if (att?.dataUrl && typeof att.dataUrl === 'string') {
+        const match = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          parts.push({
+            inlineData: {
+              mimeType: match[1],
+              data: match[2],
+            },
+          });
+        }
+      }
+    }
+
+    if (parts.length === 0) {
+      parts.push({ text: ' ' });
+    }
+
+    return { role, parts };
+  });
 
   // Gemini API requires the conversation to start with 'user'
-  if (coalesced.length > 0 && coalesced[0].role === 'model') {
-    coalesced.unshift({ role: 'user', text: 'Hello' });
+  if (mapped.length > 0 && mapped[0].role === 'model') {
+    mapped.unshift({ role: 'user', parts: [{ text: 'Hello' }] });
   }
 
   // Prepend handoff context summary to first user turn if present
-  if (formattedContext && coalesced.length > 0) {
-    const firstUser = coalesced.find((c) => c.role === 'user');
+  if (formattedContext && mapped.length > 0) {
+    const firstUser = mapped.find((c) => c.role === 'user');
     if (firstUser) {
-      firstUser.text = `${formattedContext}${firstUser.text}`;
+      const textPart = firstUser.parts.find((p) => typeof p.text === 'string');
+      if (textPart) {
+        textPart.text = `${formattedContext}${textPart.text}`;
+      } else {
+        firstUser.parts.unshift({ text: formattedContext });
+      }
     }
   }
 
   // Maintain up to 40 recent turns
-  let windowed = coalesced.length > 40 ? coalesced.slice(-40) : coalesced;
+  let windowed = mapped.length > 40 ? mapped.slice(-40) : mapped;
   if (windowed[0]?.role === 'model') {
     windowed.shift();
   }
   if (windowed.length === 0) {
-    windowed = [{ role: 'user', text: 'Hello' }];
+    windowed = [{ role: 'user', parts: [{ text: 'Hello' }] }];
   }
 
-  return windowed.map((c) => ({
-    role: c.role,
-    parts: [{ text: c.text }],
-  }));
+  return windowed;
 }
 
 function formatClaudeMessages(
   rawMessages: any[],
   formattedContext?: string
-): Array<{ role: 'user' | 'assistant'; content: string }> {
+): Array<{ role: 'user' | 'assistant'; content: any }> {
   const clean = getCleanMessages(rawMessages);
   if (clean.length === 0) {
     const defaultText = formattedContext ? `${formattedContext}Hello` : 'Hello';
     return [{ role: 'user', content: defaultText }];
   }
 
-  const mapped = clean.map((m) => ({
-    role: (m.sender === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-    content: m.text.trim(),
-  }));
+  const mapped = clean.map((m) => {
+    const role = (m.sender === 'user' ? 'user' : 'assistant') as 'user' | 'assistant';
+    const text = typeof m.text === 'string' ? m.text.trim() : '';
+    const attachments = getMessageAttachments(m);
+    const contentList: any[] = [];
+
+    if (text) {
+      contentList.push({ type: 'text', text });
+    }
+
+    for (const att of attachments) {
+      if (att?.dataUrl?.startsWith('data:image/')) {
+        const match = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          contentList.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: match[1],
+              data: match[2],
+            },
+          });
+        }
+      }
+    }
+
+    if (contentList.length === 0) {
+      contentList.push({ type: 'text', text: ' ' });
+    }
+
+    const content = contentList.length === 1 && contentList[0].type === 'text' ? contentList[0].text : contentList;
+    return { role, content };
+  });
 
   // Strict alternation: user, assistant, user, assistant
-  const coalesced: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  const coalesced: Array<{ role: 'user' | 'assistant'; content: any }> = [];
   for (const item of mapped) {
     if (coalesced.length > 0 && coalesced[coalesced.length - 1].role === item.role) {
-      coalesced[coalesced.length - 1].content += `\n\n${item.content}`;
+      const prev = coalesced[coalesced.length - 1];
+      const prevArr = Array.isArray(prev.content) ? prev.content : [{ type: 'text', text: prev.content }];
+      const nextArr = Array.isArray(item.content) ? item.content : [{ type: 'text', text: item.content }];
+      prev.content = [...prevArr, ...nextArr];
     } else {
-      coalesced.push({ role: item.role, content: item.content });
+      coalesced.push(item);
     }
   }
 
@@ -150,7 +226,16 @@ function formatClaudeMessages(
   if (formattedContext && coalesced.length > 0) {
     const firstUser = coalesced.find((c) => c.role === 'user');
     if (firstUser) {
-      firstUser.content = `${formattedContext}${firstUser.content}`;
+      if (typeof firstUser.content === 'string') {
+        firstUser.content = `${formattedContext}${firstUser.content}`;
+      } else if (Array.isArray(firstUser.content)) {
+        const textPart = firstUser.content.find((p) => p.type === 'text');
+        if (textPart) {
+          textPart.text = `${formattedContext}${textPart.text}`;
+        } else {
+          firstUser.content.unshift({ type: 'text', text: formattedContext });
+        }
+      }
     }
   }
 
@@ -168,31 +253,69 @@ function formatClaudeMessages(
 function formatChatGptMessages(
   rawMessages: any[],
   formattedContext?: string
-): Array<{ role: 'user' | 'assistant'; content: string }> {
+): Array<{ role: 'user' | 'assistant'; content: any }> {
   const clean = getCleanMessages(rawMessages);
   if (clean.length === 0) {
     const defaultText = formattedContext ? `${formattedContext}Hello` : 'Hello';
     return [{ role: 'user', content: defaultText }];
   }
 
-  const mapped = clean.map((m) => ({
-    role: (m.sender === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-    content: m.text.trim(),
-  }));
+  const mapped = clean.map((m) => {
+    const role = (m.sender === 'user' ? 'user' : 'assistant') as 'user' | 'assistant';
+    const text = typeof m.text === 'string' ? m.text.trim() : '';
+    const attachments = getMessageAttachments(m);
+    const contentList: any[] = [];
 
-  const coalesced: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+    if (text) {
+      contentList.push({ type: 'text', text });
+    }
+
+    for (const att of attachments) {
+      if (att?.dataUrl?.startsWith('data:image/')) {
+        contentList.push({
+          type: 'image_url',
+          image_url: { url: att.dataUrl },
+        });
+      }
+    }
+
+    if (contentList.length === 0) {
+      contentList.push({ type: 'text', text: ' ' });
+    }
+
+    const content = contentList.length === 1 && contentList[0].type === 'text' ? contentList[0].text : contentList;
+    return { role, content };
+  });
+
+  const coalesced: Array<{ role: 'user' | 'assistant'; content: any }> = [];
   for (const item of mapped) {
     if (coalesced.length > 0 && coalesced[coalesced.length - 1].role === item.role) {
-      coalesced[coalesced.length - 1].content += `\n\n${item.content}`;
+      const prev = coalesced[coalesced.length - 1];
+      const prevArr = Array.isArray(prev.content) ? prev.content : [{ type: 'text', text: prev.content }];
+      const nextArr = Array.isArray(item.content) ? item.content : [{ type: 'text', text: item.content }];
+      prev.content = [...prevArr, ...nextArr];
     } else {
-      coalesced.push({ role: item.role, content: item.content });
+      coalesced.push(item);
     }
+  }
+
+  if (coalesced.length > 0 && coalesced[0].role === 'assistant') {
+    coalesced.unshift({ role: 'user', content: 'Hello' });
   }
 
   if (formattedContext && coalesced.length > 0) {
     const firstUser = coalesced.find((c) => c.role === 'user');
     if (firstUser) {
-      firstUser.content = `${formattedContext}${firstUser.content}`;
+      if (typeof firstUser.content === 'string') {
+        firstUser.content = `${formattedContext}${firstUser.content}`;
+      } else if (Array.isArray(firstUser.content)) {
+        const textPart = firstUser.content.find((p) => p.type === 'text');
+        if (textPart) {
+          textPart.text = `${formattedContext}${textPart.text}`;
+        } else {
+          firstUser.content.unshift({ type: 'text', text: formattedContext });
+        }
+      }
     }
   }
 
@@ -228,7 +351,18 @@ app.post('/api/ai/chat', async (req, res) => {
       (typeof provider === 'string' && provider.toLowerCase().includes('axon')) ||
       (typeof model === 'string' && model.toLowerCase().includes('axon'));
 
-    if (provider === 'gemini' || (!provider && !isAxonProvider && (normalizedModel.includes('gemini') || process.env.GEMINI_API_KEY))) {
+    const hasVisualAttachments = Array.isArray(messages) && messages.some((m: any) => {
+      const atts = getMessageAttachments(m);
+      return atts.some((a: any) => a?.type?.startsWith('image/') || (typeof a?.dataUrl === 'string' && a.dataUrl.startsWith('data:image/')));
+    });
+
+    const shouldDelegateToGemini =
+      provider === 'gemini' ||
+      (hasVisualAttachments && (apiKey || process.env.GEMINI_API_KEY)) ||
+      (!provider && !isAxonProvider && (normalizedModel.includes('gemini') || process.env.GEMINI_API_KEY)) ||
+      (isAxonProvider && hasVisualAttachments && (apiKey || process.env.GEMINI_API_KEY));
+
+    if (shouldDelegateToGemini) {
       const activeKey = apiKey || process.env.GEMINI_API_KEY;
       if (!activeKey) {
         return res.status(400).json({
@@ -247,12 +381,13 @@ app.post('/api/ai/chat', async (req, res) => {
         },
       });
 
-      // Format multi-turn conversation history for Gemini
+      // Format multi-turn conversation history for Gemini (including visual inlineData images)
       const geminiContents = formatGeminiContents(messages, formattedContext);
 
       try {
-        const candidateModels = [normalizedModel, 'gemini-3.6-flash', 'gemini-3.8-flash'].filter(
-          (m, idx, arr) => m && arr.indexOf(m) === idx
+        const preferredModel = normalizedModel && !normalizedModel.includes('axon') ? normalizedModel : 'gemini-3.8-flash';
+        const candidateModels = [preferredModel, 'gemini-3.8-flash', 'gemini-3.6-flash'].filter(
+          (m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx
         );
         let response: any = null;
         let lastError: any = null;

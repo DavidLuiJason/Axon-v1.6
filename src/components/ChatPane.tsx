@@ -25,6 +25,7 @@ import {
   Image as ImageIcon,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { ChatAttachment } from '../types';
 import { AxonLogo } from './AxonLogo';
 import { ModelSelectorModal } from './ModelSelectorModal';
 import { ChatShortcutBar } from './ChatShortcutBar';
@@ -70,12 +71,7 @@ export const ChatPane: React.FC = () => {
   const [isExtractingNote, setIsExtractingNote] = useState(false);
   const extractMenuRef = useRef<HTMLDivElement>(null);
 
-  const [attachedFile, setAttachedFile] = useState<{
-    name: string;
-    type: string;
-    size?: string;
-    dataUrl?: string;
-  } | null>(null);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -157,12 +153,12 @@ export const ChatPane: React.FC = () => {
   };
 
   const handleSendMessage = () => {
-    if (!inputVal.trim() && !attachedFile) return;
+    if (!inputVal.trim() && attachments.length === 0) return;
 
-    addMessage(inputVal.trim(), attachedFile || undefined);
+    addMessage(inputVal.trim(), attachments);
 
     setInputVal('');
-    setAttachedFile(null);
+    setAttachments([]);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -189,23 +185,126 @@ export const ChatPane: React.FC = () => {
     fileInputRef.current?.click();
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const processFileForAttachment = (file: File): Promise<ChatAttachment> => {
+    return new Promise((resolve) => {
+      // If not an image or is SVG/GIF (which shouldn't be rasterized), read directly
+      if (!file.type.startsWith('image/') || file.type.includes('svg') || file.type.includes('gif')) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          resolve({
+            name: file.name,
+            type: file.type || 'application/octet-stream',
+            size: `${(file.size / 1024).toFixed(1)} KB`,
+            dataUrl: typeof reader.result === 'string' ? reader.result : undefined,
+          });
+        };
+        reader.onerror = () => {
+          resolve({
+            name: file.name,
+            type: file.type || 'application/octet-stream',
+            size: `${(file.size / 1024).toFixed(1)} KB`,
+          });
+        };
+        reader.readAsDataURL(file);
+        return;
+      }
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const sizeStr = `${(file.size / 1024).toFixed(1)} KB`;
-      setAttachedFile({
-        name: file.name,
-        type: file.type,
-        size: sizeStr,
-        dataUrl: typeof reader.result === 'string' ? reader.result : undefined,
-      });
-      showToast(`Attached ${file.name}`);
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
+      // Image file: scale down if large to prevent memory exhaustion and payload limits
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const rawDataUrl = typeof e.target?.result === 'string' ? e.target.result : '';
+        if (!rawDataUrl) {
+          resolve({
+            name: file.name,
+            type: file.type,
+            size: `${(file.size / 1024).toFixed(1)} KB`,
+          });
+          return;
+        }
+
+        const img = new Image();
+        img.onload = () => {
+          const MAX_DIM = 1600;
+          let { width, height } = img;
+          if (width <= MAX_DIM && height <= MAX_DIM && file.size < 800 * 1024) {
+            resolve({
+              name: file.name,
+              type: file.type,
+              size: `${(file.size / 1024).toFixed(1)} KB`,
+              dataUrl: rawDataUrl,
+            });
+            return;
+          }
+
+          if (width > height) {
+            if (width > MAX_DIM) {
+              height = Math.round((height * MAX_DIM) / width);
+              width = MAX_DIM;
+            }
+          } else {
+            if (height > MAX_DIM) {
+              width = Math.round((width * MAX_DIM) / height);
+              height = MAX_DIM;
+            }
+          }
+
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve({
+              name: file.name,
+              type: file.type,
+              size: `${(file.size / 1024).toFixed(1)} KB`,
+              dataUrl: rawDataUrl,
+            });
+            return;
+          }
+
+          ctx.drawImage(img, 0, 0, width, height);
+          const isPng = file.type === 'image/png';
+          const mime = isPng && file.size < 1024 * 1024 ? 'image/png' : 'image/jpeg';
+          const compressedDataUrl = canvas.toDataURL(mime, 0.85);
+          const approxBytes = Math.round((compressedDataUrl.length * 3) / 4);
+          resolve({
+            name: file.name,
+            type: mime,
+            size: `${(approxBytes / 1024).toFixed(1)} KB`,
+            dataUrl: compressedDataUrl,
+          });
+        };
+        img.onerror = () => {
+          resolve({
+            name: file.name,
+            type: file.type,
+            size: `${(file.size / 1024).toFixed(1)} KB`,
+            dataUrl: rawDataUrl,
+          });
+        };
+        img.src = rawDataUrl;
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files: File[] = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    try {
+      const processed = await Promise.all(files.map((file) => processFileForAttachment(file)));
+      setAttachments((prev) => [...prev, ...processed]);
+      showToast(`Attached ${files.length} file${files.length > 1 ? 's' : ''}`);
+    } catch (err) {
+      console.warn('Attachment processing error:', err);
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleRemoveAttachment = (indexToRemove: number) => {
+    setAttachments((prev) => prev.filter((_, idx) => idx !== indexToRemove));
   };
 
   const handleCopyText = async (msgId: string, text: string) => {
@@ -621,32 +720,46 @@ export const ChatPane: React.FC = () => {
                       : 'bg-white text-black font-normal rounded-tr-sm shadow-md'
                   }`}
                 >
-                  {/* Optional Attachment Preview */}
-                  {msg.attachment && (
-                    <div
-                      className={`mb-2 p-2 rounded-xl flex items-center gap-2 border text-xs ${
-                        isAxon
-                          ? 'bg-neutral-950 border-neutral-800 text-neutral-300'
-                          : 'bg-neutral-100 border-neutral-200 text-neutral-800'
-                      }`}
-                    >
-                      {msg.attachment.type.startsWith('image/') && msg.attachment.dataUrl ? (
-                        <img
-                          src={msg.attachment.dataUrl}
-                          alt={msg.attachment.name}
-                          className="w-10 h-10 object-cover rounded-lg"
-                        />
-                      ) : (
-                        <Paperclip className="w-4 h-4 text-neutral-500 shrink-0" />
-                      )}
-                      <div className="truncate flex-1">
-                        <p className="font-medium truncate">{msg.attachment.name}</p>
-                        {msg.attachment.size && (
-                          <p className="text-[10px] opacity-70">{msg.attachment.size}</p>
-                        )}
+                  {/* Attachments Preview (Single or Multiple) */}
+                  {(() => {
+                    const messageAttachments = msg.attachments || (msg.attachment ? [msg.attachment] : []);
+                    if (messageAttachments.length === 0) return null;
+                    return (
+                      <div className="mb-2.5 flex flex-col gap-1.5">
+                        {messageAttachments.map((att, attIdx) => {
+                          const isImage = att.type?.startsWith('image/') || (typeof att.dataUrl === 'string' && att.dataUrl.startsWith('data:image/'));
+                          return (
+                            <div
+                              key={attIdx}
+                              className={`p-2 rounded-xl flex items-center gap-2 border text-xs ${
+                                isAxon
+                                  ? 'bg-neutral-950 border-neutral-800 text-neutral-300'
+                                  : 'bg-neutral-100 border-neutral-200 text-neutral-800'
+                              }`}
+                            >
+                              {isImage && att.dataUrl ? (
+                                <img
+                                  src={att.dataUrl}
+                                  alt={att.name}
+                                  className="w-12 h-12 object-cover rounded-lg shrink-0 border border-black/10 dark:border-white/10"
+                                />
+                              ) : (
+                                <span className="p-2 rounded-lg bg-black/5 dark:bg-white/10 shrink-0">
+                                  <Paperclip className="w-4 h-4 text-neutral-400" />
+                                </span>
+                              )}
+                              <div className="truncate flex-1 min-w-0">
+                                <p className="font-medium truncate">{att.name}</p>
+                                {att.size && (
+                                  <p className="text-[10px] opacity-70">{att.size}</p>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
-                    </div>
-                  )}
+                    );
+                  })()}
 
                   <p className="whitespace-pre-wrap break-words">{messageText}</p>
 
@@ -822,43 +935,66 @@ export const ChatPane: React.FC = () => {
           </div>
         )}
 
-        {/* Attachment Draft Pill if user selected an image/file */}
-        {attachedFile && (
+        {/* Attachment Draft Pills if user selected files/images */}
+        {attachments.length > 0 && (
           <div
-            id="chat-attached-file-pill"
-            className="mx-3 mt-2 p-2 rounded-xl bg-neutral-900 border border-neutral-800 flex items-center justify-between text-xs"
+            id="chat-attached-files-container"
+            className="mx-3 mt-2 flex flex-wrap gap-1.5 max-h-32 overflow-y-auto"
           >
-            <div className="flex items-center gap-2 truncate">
-              {attachedFile.type.startsWith('image/') ? (
-                <span className="p-1 rounded bg-neutral-800 text-white">
-                  <Paperclip className="w-3.5 h-3.5" />
-                </span>
-              ) : (
-                <span className="p-1 rounded bg-neutral-800 text-white">
-                  <Paperclip className="w-3.5 h-3.5" />
-                </span>
-              )}
-              <span className="truncate max-w-[200px] text-neutral-200">{attachedFile.name}</span>
-              <span className="text-[10px] text-neutral-500">{attachedFile.size}</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setAttachedFile(null);
-                if (fileInputRef.current) fileInputRef.current.value = '';
-              }}
-              className="p-1 text-neutral-400 hover:text-white rounded"
-              title="Remove attached file"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
+            {attachments.map((att, idx) => {
+              const isImage = att.type?.startsWith('image/') || (typeof att.dataUrl === 'string' && att.dataUrl.startsWith('data:image/'));
+              return (
+                <div
+                  key={idx}
+                  id={`chat-attached-file-pill-${idx}`}
+                  className="p-1.5 pr-2 rounded-xl bg-neutral-900 border border-neutral-800 flex items-center gap-2 text-xs"
+                >
+                  {isImage && att.dataUrl ? (
+                    <img
+                      src={att.dataUrl}
+                      alt={att.name}
+                      className="w-7 h-7 object-cover rounded-lg border border-neutral-700 shrink-0"
+                    />
+                  ) : (
+                    <span className="p-1.5 rounded-lg bg-neutral-800 text-neutral-300 shrink-0">
+                      <Paperclip className="w-3.5 h-3.5" />
+                    </span>
+                  )}
+                  <div className="flex flex-col min-w-0 max-w-[140px]">
+                    <span className="truncate text-neutral-200 font-medium text-[11px]">{att.name}</span>
+                    {att.size && <span className="text-[9px] text-neutral-500">{att.size}</span>}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveAttachment(idx)}
+                    className="p-1 text-neutral-400 hover:text-white rounded hover:bg-neutral-800 transition-colors"
+                    title={`Remove ${att.name}`}
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+            {attachments.length > 1 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setAttachments([]);
+                  if (fileInputRef.current) fileInputRef.current.value = '';
+                }}
+                className="self-center px-2 py-1 text-[10px] text-neutral-400 hover:text-neutral-200 rounded-lg bg-neutral-900 border border-neutral-800"
+              >
+                Clear all ({attachments.length})
+              </button>
+            )}
           </div>
         )}
 
-        {/* Hidden File Input */}
+        {/* Hidden File Input (supports multiple file selection) */}
         <input
           ref={fileInputRef}
           type="file"
+          multiple
           className="hidden"
           onChange={handleFileChange}
         />
@@ -952,16 +1088,16 @@ export const ChatPane: React.FC = () => {
             id="chat-send-btn"
             type="button"
             onClick={handleSendMessage}
-            disabled={(!inputVal.trim() && !attachedFile) || isGeneratingResponse}
+            disabled={(!inputVal.trim() && attachments.length === 0) || isGeneratingResponse}
             aria-label="Send message"
             style={{
               backgroundColor:
-                (inputVal.trim() || attachedFile) && !isGeneratingResponse
+                (inputVal.trim() || attachments.length > 0) && !isGeneratingResponse
                   ? functionColors.sendButtonColor || '#ffffff'
                   : undefined,
             }}
             className={`p-2 rounded-xl transition-all flex items-center justify-center shrink-0 ${
-              (inputVal.trim() || attachedFile) && !isGeneratingResponse
+              (inputVal.trim() || attachments.length > 0) && !isGeneratingResponse
                 ? 'text-black active:scale-95 shadow-md hover:bg-neutral-200'
                 : 'bg-neutral-800 text-neutral-600 cursor-not-allowed'
             }`}

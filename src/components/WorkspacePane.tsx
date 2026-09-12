@@ -19,8 +19,15 @@ import {
   Tablet,
   Code,
   ArrowDownToLine,
+  History,
+  Zap,
+  ZapOff,
+  Clock,
+  Search,
+  X,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { WorkspaceSnippetHistoryItem } from '../types';
 
 type WorkspaceMode = 'javascript' | 'html' | 'json';
 type ViewportSize = 'desktop' | 'tablet' | 'mobile';
@@ -131,7 +138,19 @@ const DEFAULT_HTML_CODE = `<!DOCTYPE html>
 </html>`;
 
 export const WorkspacePane: React.FC = () => {
-  const { navigateTo, showToast, activeProjectMessages, savedScripts, saveScript } = useApp();
+  const {
+    navigateTo,
+    showToast,
+    activeProjectMessages,
+    savedScripts,
+    saveScript,
+    workspaceCodeLoadMode,
+    setWorkspaceCodeLoadMode,
+    workspaceSnippetHistory,
+    addWorkspaceSnippetHistory,
+    deleteWorkspaceSnippetHistoryItem,
+    clearWorkspaceSnippetHistory,
+  } = useApp();
 
   const [activeTab, setActiveTab] = useState<'code' | 'preview' | 'terminal'>('code');
   const [mode, setMode] = useState<WorkspaceMode>('javascript');
@@ -142,6 +161,9 @@ export const WorkspacePane: React.FC = () => {
   const [executionError, setExecutionError] = useState<string | null>(null);
   const [executionTimeMs, setExecutionTimeMs] = useState<number | null>(null);
   const [viewportSize, setViewportSize] = useState<ViewportSize>('desktop');
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [historySearchQuery, setHistorySearchQuery] = useState('');
+  const lastAutoLoadedCodeRef = useRef<string>('');
   const [logs, setLogs] = useState<ConsoleLog[]>([
     {
       id: 'init',
@@ -174,19 +196,85 @@ export const WorkspacePane: React.FC = () => {
     return null;
   }, [activeProjectMessages]);
 
+  // Handle auto-loading code into Workspace if auto mode is enabled
+  useEffect(() => {
+    if (workspaceCodeLoadMode === 'auto' && detectedChatCode) {
+      if (detectedChatCode.code !== lastAutoLoadedCodeRef.current) {
+        lastAutoLoadedCodeRef.current = detectedChatCode.code;
+        setCode(detectedChatCode.code);
+        let targetMode: WorkspaceMode = 'javascript';
+        if (
+          detectedChatCode.lang === 'html' ||
+          detectedChatCode.code.includes('<html') ||
+          detectedChatCode.code.includes('<!DOCTYPE')
+        ) {
+          targetMode = 'html';
+        } else if (detectedChatCode.lang === 'json') {
+          targetMode = 'json';
+        }
+        setMode(targetMode);
+
+        const firstLine = detectedChatCode.code.split('\n')[0].replace(/^\/\/\s*|^<!--\s*|^#\s*/, '').trim();
+        const snippetTitle = firstLine && firstLine.length < 50 ? firstLine : `Auto ${targetMode.toUpperCase()} Snippet`;
+        addWorkspaceSnippetHistory({
+          title: snippetTitle,
+          code: detectedChatCode.code,
+          language: targetMode,
+          source: 'chat_auto',
+        });
+        showToast(`Auto-loaded code snippet into Workspace`);
+      }
+    }
+  }, [workspaceCodeLoadMode, detectedChatCode, addWorkspaceSnippetHistory, showToast]);
+
   const handleLoadChatCode = () => {
     if (!detectedChatCode) return;
+    lastAutoLoadedCodeRef.current = detectedChatCode.code;
     setCode(detectedChatCode.code);
+    let targetMode: WorkspaceMode = 'javascript';
     if (detectedChatCode.lang === 'html' || detectedChatCode.code.includes('<html') || detectedChatCode.code.includes('<!DOCTYPE')) {
-      setMode('html');
+      targetMode = 'html';
     } else if (detectedChatCode.lang === 'json') {
-      setMode('json');
-    } else {
-      setMode('javascript');
+      targetMode = 'json';
     }
+    setMode(targetMode);
+
+    const firstLine = detectedChatCode.code.split('\n')[0].replace(/^\/\/\s*|^<!--\s*|^#\s*/, '').trim();
+    const snippetTitle = firstLine && firstLine.length < 50 ? firstLine : `Snippet (${targetMode.toUpperCase()})`;
+    addWorkspaceSnippetHistory({
+      title: snippetTitle,
+      code: detectedChatCode.code,
+      language: targetMode,
+      source: 'chat_manual',
+    });
     showToast(`Loaded code block from ${detectedChatCode.source}`);
     setActiveTab('code');
   };
+
+  const handleLoadFromHistory = (item: WorkspaceSnippetHistoryItem) => {
+    setCode(item.code);
+    let targetMode: WorkspaceMode = 'javascript';
+    if (item.language === 'html' || item.code.includes('<html') || item.code.includes('<!DOCTYPE')) {
+      targetMode = 'html';
+    } else if (item.language === 'json') {
+      targetMode = 'json';
+    }
+    setMode(targetMode);
+    setActiveTab('code');
+    setIsHistoryOpen(false);
+    showToast(`Loaded "${item.title}" into Workspace`);
+  };
+
+  const filteredHistory = useMemo(() => {
+    if (!historySearchQuery.trim()) return workspaceSnippetHistory;
+    const query = historySearchQuery.toLowerCase();
+    return workspaceSnippetHistory.filter(
+      (item) =>
+        item.title.toLowerCase().includes(query) ||
+        item.language.toLowerCase().includes(query) ||
+        item.code.toLowerCase().includes(query)
+    );
+  }, [workspaceSnippetHistory, historySearchQuery]);
 
   const handleModeChange = (newMode: WorkspaceMode) => {
     setMode(newMode);
@@ -526,6 +614,51 @@ export const WorkspacePane: React.FC = () => {
             <option value="json">JSON</option>
           </select>
 
+          {/* Auto / Manual Code Load Toggle */}
+          <button
+            id="workspace-load-mode-toggle-btn"
+            type="button"
+            onClick={() => {
+              const nextMode = workspaceCodeLoadMode === 'auto' ? 'manual' : 'auto';
+              setWorkspaceCodeLoadMode(nextMode);
+              showToast(`Workspace code loading set to ${nextMode.toUpperCase()}`);
+            }}
+            title={`Code Load Mode: ${workspaceCodeLoadMode === 'auto' ? 'Auto-Load ON' : 'Manual (Click to Auto)'}`}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium border transition-colors ${
+              workspaceCodeLoadMode === 'auto'
+                ? 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25'
+                : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+            }`}
+          >
+            {workspaceCodeLoadMode === 'auto' ? (
+              <>
+                <Zap className="w-3 h-3 text-amber-400 fill-amber-400" />
+                <span className="hidden xs:inline text-[11px]">Auto</span>
+              </>
+            ) : (
+              <>
+                <ZapOff className="w-3 h-3 text-neutral-400" />
+                <span className="hidden xs:inline text-[11px]">Manual</span>
+              </>
+            )}
+          </button>
+
+          {/* Snippet History Button */}
+          <button
+            id="workspace-history-btn"
+            type="button"
+            onClick={() => setIsHistoryOpen(true)}
+            title="Workspace Code History"
+            className="p-1.5 rounded-lg text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors flex items-center gap-1"
+          >
+            <History className="w-3.5 h-3.5" />
+            {workspaceSnippetHistory.length > 0 && (
+              <span className="px-1.5 py-0.2 text-[9px] rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 font-mono">
+                {workspaceSnippetHistory.length}
+              </span>
+            )}
+          </button>
+
           {/* Copy Button */}
           <button
             id="workspace-copy-btn"
@@ -581,19 +714,38 @@ export const WorkspacePane: React.FC = () => {
       {detectedChatCode && activeTab === 'code' && (
         <div className="bg-neutral-900/90 border-b border-neutral-800/80 px-3 py-1.5 flex items-center justify-between text-[11px] text-neutral-300 shrink-0">
           <div className="flex items-center gap-2 truncate mr-2">
-            <Sparkles className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-            <span className="truncate">
-              Code block detected in chat ({detectedChatCode.lang})
-            </span>
+            {workspaceCodeLoadMode === 'auto' ? (
+              <>
+                <Zap className="w-3.5 h-3.5 text-amber-400 fill-amber-400 shrink-0" />
+                <span className="truncate">
+                  Auto-load active: synced with chat ({detectedChatCode.lang})
+                </span>
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                <span className="truncate">
+                  Code block detected in chat ({detectedChatCode.lang})
+                </span>
+              </>
+            )}
           </div>
-          <button
-            type="button"
-            onClick={handleLoadChatCode}
-            className="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-white font-medium shrink-0 flex items-center gap-1 text-[10px] border border-neutral-700"
-          >
-            <ArrowDownToLine className="w-3 h-3" />
-            <span>Load into Workspace</span>
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {workspaceCodeLoadMode === 'manual' ? (
+              <button
+                type="button"
+                onClick={handleLoadChatCode}
+                className="px-2 py-0.5 rounded bg-white text-black hover:bg-neutral-200 font-medium shrink-0 flex items-center gap-1 text-[10px] shadow-xs"
+              >
+                <ArrowDownToLine className="w-3 h-3" />
+                <span>Load Code</span>
+              </button>
+            ) : (
+              <span className="text-[10px] text-amber-400 font-mono flex items-center gap-1">
+                <Check className="w-3 h-3" /> Auto-loaded
+              </span>
+            )}
+          </div>
         </div>
       )}
 
@@ -873,6 +1025,153 @@ export const WorkspacePane: React.FC = () => {
           Open in Full Studio &gt;
         </button>
       </div>
+
+      {/* Workspace Code History Slide-over Drawer */}
+      {isHistoryOpen && (
+        <div
+          id="workspace-history-modal"
+          className="absolute inset-0 z-50 bg-black/80 backdrop-blur-xs flex justify-end animate-in fade-in duration-150"
+        >
+          <div className="w-full sm:max-w-md h-full bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl">
+            {/* Header */}
+            <div className="p-3 border-b border-neutral-800 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <History className="w-4 h-4 text-sky-400" />
+                <h3 className="text-sm font-semibold text-white">Code History</h3>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 font-mono">
+                  {workspaceSnippetHistory.length}
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                {workspaceSnippetHistory.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (window.confirm('Clear all workspace snippet history?')) {
+                        clearWorkspaceSnippetHistory();
+                        showToast('Workspace history cleared');
+                      }
+                    }}
+                    className="p-1.5 text-neutral-400 hover:text-red-400 hover:bg-neutral-800 rounded-lg transition-colors text-[10px] flex items-center gap-1"
+                    title="Clear all history"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span className="hidden xs:inline">Clear</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setIsHistoryOpen(false)}
+                  className="p-1.5 text-neutral-400 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors"
+                  title="Close history"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Search Bar & Auto-load mode indicator */}
+            <div className="p-2.5 border-b border-neutral-800/80 bg-neutral-900/40 flex flex-col gap-2">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-neutral-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={historySearchQuery}
+                  onChange={(e) => setHistorySearchQuery(e.target.value)}
+                  placeholder="Search snippets by title, lang, or code..."
+                  className="w-full pl-8 pr-3 py-1.5 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-neutral-600"
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-neutral-400 px-1">
+                <span className="flex items-center gap-1">
+                  <span className="text-neutral-500">Mode:</span>
+                  <span className={workspaceCodeLoadMode === 'auto' ? 'text-amber-400 font-medium' : 'text-neutral-300'}>
+                    {workspaceCodeLoadMode === 'auto' ? '⚡ Auto-Load Enabled' : 'Manual Loading'}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextMode = workspaceCodeLoadMode === 'auto' ? 'manual' : 'auto';
+                    setWorkspaceCodeLoadMode(nextMode);
+                    showToast(`Workspace code loading set to ${nextMode.toUpperCase()}`);
+                  }}
+                  className="text-[10px] text-sky-400 hover:underline"
+                >
+                  Switch to {workspaceCodeLoadMode === 'auto' ? 'Manual' : 'Auto'}
+                </button>
+              </div>
+            </div>
+
+            {/* Snippet List */}
+            <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-2.5">
+              {filteredHistory.length === 0 ? (
+                <div className="h-48 flex flex-col items-center justify-center text-center p-4 text-neutral-500">
+                  <History className="w-8 h-8 mb-2 opacity-30" />
+                  <p className="text-xs font-medium text-neutral-400">No snippets recorded</p>
+                  <p className="text-[11px] text-neutral-500 mt-1 max-w-xs">
+                    Every code block loaded into the Workspace (either automatically or manually) will be preserved here.
+                  </p>
+                </div>
+              ) : (
+                filteredHistory.map((item) => (
+                  <div
+                    key={item.id}
+                    className="group border border-neutral-800 hover:border-neutral-700 rounded-xl bg-neutral-900/60 p-2.5 flex flex-col gap-2 transition-all hover:bg-neutral-900"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-xs font-semibold text-neutral-200 truncate">
+                            {item.title}
+                          </span>
+                          <span className="text-[9px] uppercase font-mono px-1.5 py-0.2 rounded bg-neutral-800 border border-neutral-700 text-neutral-400">
+                            {item.language}
+                          </span>
+                          {item.source === 'chat_auto' && (
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/10 border border-amber-500/20 text-amber-400 flex items-center gap-0.5">
+                              <Zap className="w-2.5 h-2.5 fill-amber-400" /> Auto
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-[10px] text-neutral-500 font-mono mt-0.5 block">
+                          {item.timestamp}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleLoadFromHistory(item)}
+                          className="px-2 py-1 rounded bg-white text-black text-[11px] font-semibold hover:bg-neutral-200 transition-colors shadow-xs"
+                          title="Load into Workspace Editor"
+                        >
+                          Load
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            deleteWorkspaceSnippetHistoryItem(item.id);
+                            showToast('Snippet removed from history');
+                          }}
+                          className="p-1 rounded text-neutral-500 hover:text-red-400 hover:bg-neutral-800 transition-colors"
+                          title="Delete from history"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Code preview (first 4 lines) */}
+                    <pre className="p-2 rounded-lg bg-black/60 border border-neutral-800 text-[10px] text-neutral-400 font-mono overflow-x-hidden line-clamp-3">
+                      {item.code.split('\n').slice(0, 4).join('\n')}
+                    </pre>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect, useCallback, startTransition } from 'react';
 import { useApp } from '../context/AppContext';
 import { ChatPane } from './ChatPane';
 import { WorkspacePane } from './WorkspacePane';
@@ -13,6 +13,8 @@ export const DualPaneContainer: React.FC = () => {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
+  const leftPaneRef = useRef<HTMLDivElement>(null);
+  const rightPaneRef = useRef<HTMLDivElement>(null);
 
   // Direct gesture tracking refs - zero React re-renders during active drag
   const touchStartXRef = useRef<number | null>(null);
@@ -24,6 +26,35 @@ export const DualPaneContainer: React.FC = () => {
   const isDrawerPortalMountedRef = useRef<boolean>(false);
   const animationTimerRef = useRef<number | null>(null);
 
+  // RAF synchronization for 60/120fps fluid tracking
+  const rafIdRef = useRef<number | null>(null);
+  const pendingTrackTransformRef = useRef<string | null>(null);
+  const pendingDrawerTransformRef = useRef<{ drawer: string; overlay: number } | null>(null);
+
+  const applyPointerEvents = (enabled: boolean) => {
+    const value = enabled ? 'auto' : 'none';
+    if (leftPaneRef.current) leftPaneRef.current.style.pointerEvents = value;
+    if (rightPaneRef.current) rightPaneRef.current.style.pointerEvents = value;
+  };
+
+  const scheduleRafUpdate = () => {
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      if (trackRef.current && pendingTrackTransformRef.current !== null) {
+        trackRef.current.style.transform = pendingTrackTransformRef.current;
+      }
+      if (pendingDrawerTransformRef.current !== null) {
+        const drawer = document.getElementById('hamburger-drawer');
+        const overlay = document.getElementById('hamburger-overlay');
+        if (drawer && overlay) {
+          drawer.style.transform = pendingDrawerTransformRef.current.drawer;
+          overlay.style.opacity = `${pendingDrawerTransformRef.current.overlay}`;
+        }
+      }
+    });
+  };
+
   // Keep track in sync with paneViewState
   useEffect(() => {
     if (trackRef.current && !isGesturingRef.current) {
@@ -32,7 +63,7 @@ export const DualPaneContainer: React.FC = () => {
           ? 'translate3d(0%, 0, 0)'
           : 'translate3d(-50%, 0, 0)';
 
-      trackRef.current.style.transition = 'transform 0.3s cubic-bezier(0.22, 1, 0.36, 1)';
+      trackRef.current.style.transition = 'transform 0.28s cubic-bezier(0.16, 1, 0.3, 1)';
       trackRef.current.style.transform = targetTransform;
 
       if (animationTimerRef.current !== null) {
@@ -43,7 +74,7 @@ export const DualPaneContainer: React.FC = () => {
           trackRef.current.style.transition = 'none';
         }
         animationTimerRef.current = null;
-      }, 320);
+      }, 300);
     }
   }, [paneViewState]);
 
@@ -51,6 +82,9 @@ export const DualPaneContainer: React.FC = () => {
     return () => {
       if (animationTimerRef.current !== null) {
         window.clearTimeout(animationTimerRef.current);
+      }
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
       }
     };
   }, []);
@@ -121,6 +155,7 @@ export const DualPaneContainer: React.FC = () => {
       if (Math.abs(diffX) > Math.abs(diffY) && Math.abs(diffX) > 8) {
         gestureLockRef.current = 'horizontal';
         isGesturingRef.current = true;
+        applyPointerEvents(false);
       }
     }
 
@@ -130,19 +165,21 @@ export const DualPaneContainer: React.FC = () => {
       }
 
       const isChat = paneViewState === 'chat-only';
+      const containerWidth = containerRef.current?.clientWidth || window.innerWidth || 400;
 
       if (isChat) {
         if (diffX <= 0) {
-          // Dragging left moves towards workspace in real time on compositor thread
+          // Dragging left moves towards workspace in real time on compositor
           if (trackRef.current) {
             trackRef.current.style.transition = 'none';
-            trackRef.current.style.transform = `translate3d(${diffX}px, 0, 0)`;
+            pendingTrackTransformRef.current = `translate3d(${diffX}px, 0, 0)`;
+            scheduleRafUpdate();
           }
         } else {
           // Dragging right from chat pane opens navigation drawer with real-time tracking
           if (trackRef.current) {
             trackRef.current.style.transition = 'none';
-            trackRef.current.style.transform = 'translate3d(0%, 0, 0)';
+            pendingTrackTransformRef.current = 'translate3d(0px, 0, 0)';
           }
 
           if (!isDrawerPortalMountedRef.current) {
@@ -150,30 +187,37 @@ export const DualPaneContainer: React.FC = () => {
             setDrawerGestureOffset(0);
           }
 
-          const drawer = document.getElementById('hamburger-drawer');
-          const overlay = document.getElementById('hamburger-overlay');
-          if (drawer && overlay) {
-            const clamped = Math.min(320, Math.max(0, diffX));
-            drawer.style.transition = 'none';
-            drawer.style.transform = `translate3d(${-320 + clamped}px, 0, 0)`;
-            overlay.style.transition = 'none';
-            overlay.style.opacity = `${clamped / 320}`;
-          }
+          const clamped = Math.min(320, Math.max(0, diffX));
+          pendingDrawerTransformRef.current = {
+            drawer: `translate3d(${-320 + clamped}px, 0, 0)`,
+            overlay: clamped / 320,
+          };
+          scheduleRafUpdate();
         }
       } else {
-        // Workspace view: dragging right moves towards chat in real time
+        // Workspace view: dragging right moves towards chat in real time using pure pixels
         const offset = diffX >= 0 ? diffX : diffX * 0.18; // Rubber-band resistance on right boundary
+        const currentPx = -containerWidth + offset;
         if (trackRef.current) {
           trackRef.current.style.transition = 'none';
-          trackRef.current.style.transform = `translate3d(calc(-50% + ${offset}px), 0, 0)`;
+          pendingTrackTransformRef.current = `translate3d(${currentPx}px, 0, 0)`;
+          scheduleRafUpdate();
         }
       }
     }
   };
 
   const finishGesture = useCallback((diffX: number, velocity: number) => {
+    applyPointerEvents(true);
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    pendingTrackTransformRef.current = null;
+    pendingDrawerTransformRef.current = null;
+
     const containerWidth = containerRef.current?.clientWidth || window.innerWidth || 400;
-    const halfwayThreshold = containerWidth * 0.45;
+    const halfwayThreshold = containerWidth * 0.4;
     const isChat = paneViewState === 'chat-only';
 
     if (gestureLockRef.current === 'horizontal') {
@@ -185,9 +229,9 @@ export const DualPaneContainer: React.FC = () => {
             const drawer = document.getElementById('hamburger-drawer');
             const overlay = document.getElementById('hamburger-overlay');
             if (drawer && overlay) {
-              drawer.style.transition = 'transform 0.22s cubic-bezier(0.25, 1, 0.5, 1)';
+              drawer.style.transition = 'transform 0.24s cubic-bezier(0.16, 1, 0.3, 1)';
               drawer.style.transform = 'translate3d(0px, 0, 0)';
-              overlay.style.transition = 'opacity 0.22s ease-out';
+              overlay.style.transition = 'opacity 0.24s ease-out';
               overlay.style.opacity = '1';
             }
             openMenu();
@@ -196,7 +240,7 @@ export const DualPaneContainer: React.FC = () => {
             const drawer = document.getElementById('hamburger-drawer');
             const overlay = document.getElementById('hamburger-overlay');
             if (drawer && overlay) {
-              drawer.style.transition = 'transform 0.22s cubic-bezier(0.25, 1, 0.5, 1)';
+              drawer.style.transition = 'transform 0.22s cubic-bezier(0.16, 1, 0.3, 1)';
               drawer.style.transform = 'translate3d(-320px, 0, 0)';
               overlay.style.transition = 'opacity 0.22s ease-out';
               overlay.style.opacity = '0';
@@ -207,16 +251,18 @@ export const DualPaneContainer: React.FC = () => {
           }
         } else if (diffX < 0) {
           // Dragging left towards workspace:
-          const shouldSwitch = -diffX >= halfwayThreshold || (velocity < -0.38 && diffX < -35);
+          const shouldSwitch = -diffX >= halfwayThreshold || (velocity < -0.32 && diffX < -30);
           if (shouldSwitch) {
             if (trackRef.current) {
-              trackRef.current.style.transition = 'transform 0.3s cubic-bezier(0.22, 1, 0.36, 1)';
+              trackRef.current.style.transition = 'transform 0.28s cubic-bezier(0.16, 1, 0.3, 1)';
               trackRef.current.style.transform = 'translate3d(-50%, 0, 0)';
             }
-            setPaneViewState('workspace-only');
+            startTransition(() => {
+              setPaneViewState('workspace-only');
+            });
           } else {
             if (trackRef.current) {
-              trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.22, 1, 0.36, 1)';
+              trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.16, 1, 0.3, 1)';
               trackRef.current.style.transform = 'translate3d(0%, 0, 0)';
             }
           }
@@ -224,23 +270,25 @@ export const DualPaneContainer: React.FC = () => {
       } else {
         // In workspace view: dragging right towards chat:
         if (diffX > 0) {
-          const shouldSwitch = diffX >= halfwayThreshold || (velocity > 0.38 && diffX > 35);
+          const shouldSwitch = diffX >= halfwayThreshold || (velocity > 0.32 && diffX > 30);
           if (shouldSwitch) {
             if (trackRef.current) {
-              trackRef.current.style.transition = 'transform 0.3s cubic-bezier(0.22, 1, 0.36, 1)';
+              trackRef.current.style.transition = 'transform 0.28s cubic-bezier(0.16, 1, 0.3, 1)';
               trackRef.current.style.transform = 'translate3d(0%, 0, 0)';
             }
-            setPaneViewState('chat-only');
+            startTransition(() => {
+              setPaneViewState('chat-only');
+            });
           } else {
             if (trackRef.current) {
-              trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.22, 1, 0.36, 1)';
+              trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.16, 1, 0.3, 1)';
               trackRef.current.style.transform = 'translate3d(-50%, 0, 0)';
             }
           }
         } else {
           // Rubber band spring-back
           if (trackRef.current) {
-            trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.22, 1, 0.36, 1)';
+            trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.16, 1, 0.3, 1)';
             trackRef.current.style.transform = 'translate3d(-50%, 0, 0)';
           }
         }
@@ -255,7 +303,7 @@ export const DualPaneContainer: React.FC = () => {
         trackRef.current.style.transition = 'none';
       }
       animationTimerRef.current = null;
-    }, 320);
+    }, 300);
 
     isGesturingRef.current = false;
     isDrawerPortalMountedRef.current = false;
@@ -268,6 +316,7 @@ export const DualPaneContainer: React.FC = () => {
   const handleTouchEnd = (e: React.TouchEvent) => {
     if (touchStartXRef.current === null) {
       isGesturingRef.current = false;
+      applyPointerEvents(true);
       return;
     }
 
@@ -282,9 +331,10 @@ export const DualPaneContainer: React.FC = () => {
       touchStartXRef.current = null;
       touchStartYRef.current = null;
       gestureLockRef.current = null;
+      applyPointerEvents(true);
       if (trackRef.current) {
         const target = paneViewState === 'chat-only' ? 'translate3d(0%, 0, 0)' : 'translate3d(-50%, 0, 0)';
-        trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.22, 1, 0.36, 1)';
+        trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.16, 1, 0.3, 1)';
         trackRef.current.style.transform = target;
       }
     }
@@ -297,9 +347,10 @@ export const DualPaneContainer: React.FC = () => {
     touchStartYRef.current = null;
     gestureLockRef.current = null;
     setDrawerGestureOffset(null);
+    applyPointerEvents(true);
     if (trackRef.current) {
       const target = paneViewState === 'chat-only' ? 'translate3d(0%, 0, 0)' : 'translate3d(-50%, 0, 0)';
-      trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.22, 1, 0.36, 1)';
+      trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.16, 1, 0.3, 1)';
       trackRef.current.style.transform = target;
     }
   };
@@ -342,42 +393,44 @@ export const DualPaneContainer: React.FC = () => {
         if (Math.abs(diffX) > Math.abs(diffY) && Math.abs(diffX) > 8) {
           gestureLockRef.current = 'horizontal';
           isGesturingRef.current = true;
+          applyPointerEvents(false);
         }
       }
 
       if (gestureLockRef.current === 'horizontal') {
         const isChat = paneViewState === 'chat-only';
+        const containerWidth = containerRef.current?.clientWidth || window.innerWidth || 400;
 
         if (isChat) {
           if (diffX <= 0) {
             if (trackRef.current) {
               trackRef.current.style.transition = 'none';
-              trackRef.current.style.transform = `translate3d(${diffX}px, 0, 0)`;
+              pendingTrackTransformRef.current = `translate3d(${diffX}px, 0, 0)`;
+              scheduleRafUpdate();
             }
           } else {
             if (trackRef.current) {
               trackRef.current.style.transition = 'none';
-              trackRef.current.style.transform = 'translate3d(0%, 0, 0)';
+              pendingTrackTransformRef.current = 'translate3d(0px, 0, 0)';
             }
             if (!isDrawerPortalMountedRef.current) {
               isDrawerPortalMountedRef.current = true;
               setDrawerGestureOffset(0);
             }
-            const drawer = document.getElementById('hamburger-drawer');
-            const overlay = document.getElementById('hamburger-overlay');
-            if (drawer && overlay) {
-              const clamped = Math.min(320, Math.max(0, diffX));
-              drawer.style.transition = 'none';
-              drawer.style.transform = `translate3d(${-320 + clamped}px, 0, 0)`;
-              overlay.style.transition = 'none';
-              overlay.style.opacity = `${clamped / 320}`;
-            }
+            const clamped = Math.min(320, Math.max(0, diffX));
+            pendingDrawerTransformRef.current = {
+              drawer: `translate3d(${-320 + clamped}px, 0, 0)`,
+              overlay: clamped / 320,
+            };
+            scheduleRafUpdate();
           }
         } else {
           const offset = diffX >= 0 ? diffX : diffX * 0.18;
+          const currentPx = -containerWidth + offset;
           if (trackRef.current) {
             trackRef.current.style.transition = 'none';
-            trackRef.current.style.transform = `translate3d(calc(-50% + ${offset}px), 0, 0)`;
+            pendingTrackTransformRef.current = `translate3d(${currentPx}px, 0, 0)`;
+            scheduleRafUpdate();
           }
         }
       }
@@ -398,9 +451,10 @@ export const DualPaneContainer: React.FC = () => {
         touchStartXRef.current = null;
         touchStartYRef.current = null;
         gestureLockRef.current = null;
+        applyPointerEvents(true);
         if (trackRef.current) {
           const target = paneViewState === 'chat-only' ? 'translate3d(0%, 0, 0)' : 'translate3d(-50%, 0, 0)';
-          trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.22, 1, 0.36, 1)';
+          trackRef.current.style.transition = 'transform 0.24s cubic-bezier(0.16, 1, 0.3, 1)';
           trackRef.current.style.transform = target;
         }
       }
@@ -454,6 +508,7 @@ export const DualPaneContainer: React.FC = () => {
       >
         {/* Left Screen: Chat (Full Screen with GPU layer isolation) */}
         <div
+          ref={leftPaneRef}
           id="dual-pane-left"
           style={{
             width: '50%',
@@ -474,6 +529,7 @@ export const DualPaneContainer: React.FC = () => {
 
         {/* Right Screen: Workspace / Code (Full Screen with GPU layer isolation) */}
         <div
+          ref={rightPaneRef}
           id="dual-pane-right"
           style={{
             width: '50%',

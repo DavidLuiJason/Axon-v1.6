@@ -43,6 +43,19 @@ export interface ChatAttachment {
   dataUrl?: string;
 }
 
+export type WorkspaceCodeLoadMode = 'manual' | 'auto';
+
+export interface WorkspaceSnippetHistoryItem {
+  id: string;
+  title: string;
+  code: string;
+  language: string;
+  timestamp: string;
+  source?: 'chat_auto' | 'chat_manual' | 'editor_run' | 'editor_save' | 'custom';
+  lineCount?: number;
+  byteSize?: number;
+}
+
 export interface ChatMessage {
   id: string;
   sender: 'user' | 'axon';
@@ -55,6 +68,7 @@ export interface ChatMessage {
   workspaceArtifactId?: string;
   workspaceArtifactTitle?: string;
   attachment?: ChatAttachment;
+  attachments?: ChatAttachment[];
 }
 
 export type NoteCategory = 'general' | 'extracted_chat' | 'code' | 'prompt' | 'spec' | string;

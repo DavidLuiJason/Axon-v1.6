@@ -30,6 +30,7 @@ export interface BrainRequest {
   text: string;
   projectId?: string;
   attachment?: ChatAttachment;
+  attachments?: ChatAttachment[];
   context?: BrainRequestContext;
 }
 
@@ -605,7 +606,13 @@ export class AxonBrainCore {
 
     // 7. Check for heavy tasks outside AXON's standalone local capability (delegation candidate)
     // E.g. Multimodal vision with attachment, massive full-stack scaffolding, or live web search
-    const hasVisualAttachment = Boolean(request.attachment && request.attachment.type.startsWith('image/'));
+    const hasVisualAttachment = Boolean(
+      (request.attachment && request.attachment.type.startsWith('image/')) ||
+      (Array.isArray(request.attachments) &&
+        request.attachments.some(
+          (a) => a?.type?.startsWith('image/') || (typeof a?.dataUrl === 'string' && a.dataUrl.startsWith('data:image/'))
+        ))
+    );
     const isMassiveBuild = /(?:build a full[- ]stack (?:app|application|platform)|generate entire codebase)/i.test(lowerText);
     const requiresLiveWeb = /(?:search the live web|crawl (?:this|the) website|current stock price)/i.test(lowerText);
 
@@ -1563,9 +1570,16 @@ export class AxonBrainCore {
 
     // 1. Check if the request genuinely requires capabilities unavailable offline:
     // a. Visual pixel inspection with image attachment
-    if (request.attachment && request.attachment.type.startsWith('image/')) {
-      const fileName = request.attachment.name || 'image file';
-      return `I received your image attachment ("${fileName}") regarding "${intent.primaryGoal}". However, visual multimodal inspection requires an external cloud AI model (such as Gemini Vision). AXON's local offline core operates on-device and cannot analyze image pixels without cloud connectivity.\n\nOnce connected to an external AI model, I can analyze this visual file for you. In the meantime, I can assist with text analysis, code architecture, or local workspace tasks for this topic.`;
+    const hasVisualAttachment = Boolean(
+      (request.attachment && request.attachment.type.startsWith('image/')) ||
+      (Array.isArray(request.attachments) &&
+        request.attachments.some(
+          (a) => a?.type?.startsWith('image/') || (typeof a?.dataUrl === 'string' && a.dataUrl.startsWith('data:image/'))
+        ))
+    );
+    if (hasVisualAttachment) {
+      const fileName = request.attachment?.name || request.attachments?.[0]?.name || 'image file';
+      return `I received your image attachment ("${fileName}") regarding "${intent.primaryGoal}". However, visual multimodal inspection requires an external cloud AI model or active online connection. AXON is currently operating in offline mode on this device.\n\nOnce online connectivity is re-established or an external AI model is active, I can analyze this visual file in detail for you. In the meantime, I can assist with text analysis, code architecture, or local workspace tasks for this topic.`;
     }
 
     // b. Live web crawling or real-time internet search
