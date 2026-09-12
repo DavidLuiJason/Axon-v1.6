@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+/* Structural App-Shell Foundation: Lock document viewport so window never scrolls */
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  position: fixed;
+  inset: 0;
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: touch;
+  background-color: #000000;
+}
+
+/* GPU Hardware Layer Promotion & Anti-Glitch Compositing Rules */
+.gpu-layer {
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+  isolation: isolate;
+  contain: layout paint;
+}
+
+.swipe-track {
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  -webkit-transform-style: flat;
+  transform-style: flat;
+  will-change: transform;
+}
+
+.swipe-panel {
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+  isolation: isolate;
+  contain: layout paint;
+  background-color: #000000;
+}
+
